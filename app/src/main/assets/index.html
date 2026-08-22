@@ -161,9 +161,16 @@
 
     var loader = new THREE.TextureLoader();
     loader.crossOrigin = "anonymous";
-    var earthTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-blue-marble.jpg", onFirstTextureLoaded);
-    var bumpTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-topology.png");
-    var specTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-water.png");
+    var earthTex = loader.load(
+      "https://unpkg.com/three-globe@2/example/img/earth-blue-marble.jpg",
+      onFirstTextureLoaded,
+      undefined,
+      function(err){ console.error('Earth texture failed to load', err); onFirstTextureLoaded(true); }
+    );
+    var bumpTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-topology.png", undefined, undefined,
+      function(err){ console.error('Bump texture failed to load', err); });
+    var specTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-water.png", undefined, undefined,
+      function(err){ console.error('Specular texture failed to load', err); });
 
     var geo = new THREE.SphereGeometry(1, 64, 64);
     var mat = new THREE.MeshPhongMaterial({
@@ -173,10 +180,16 @@
     globe = new THREE.Mesh(geo, mat);
     earthGroup.add(globe);
 
-    var cloudTex = loader.load("https://unpkg.com/three-globe@2/example/img/earth-clouds.png");
+    var cloudTex = loader.load(
+      "https://unpkg.com/three-globe@2/example/img/earth-clouds.png",
+      function(){ cloudMesh.visible = true; },
+      undefined,
+      function(err){ console.error('Cloud texture failed to load', err); cloudMesh.visible = false; setInfoWarning('Cloud texture failed to load — check connection'); }
+    );
     var cloudGeo = new THREE.SphereGeometry(1.006, 64, 64);
     var cloudMat = new THREE.MeshLambertMaterial({map:cloudTex, transparent:true, opacity:0.5, depthWrite:false});
     cloudMesh = new THREE.Mesh(cloudGeo, cloudMat);
+    cloudMesh.visible = false; // shown once the texture actually loads, so a failed load doesn't render a flat gray shell
     earthGroup.add(cloudMesh);
 
     var atmoGeo = new THREE.SphereGeometry(1.06, 48, 48);
@@ -224,8 +237,22 @@
     window._moonPhaseFrac = phaseFrac;
   }
 
-  function onFirstTextureLoaded(){
+  function onFirstTextureLoaded(failed){
     document.getElementById('loading').style.display = 'none';
+    if(failed){ setInfoWarning('Earth texture failed to load — check connection, then reopen the app'); }
+  }
+
+  // Shows a temporary message in the info line, then reverts to the normal instructions after a few seconds.
+  var infoWarningTimer = null;
+  function setInfoWarning(msg, ms){
+    var el = document.getElementById('info');
+    if(infoWarningTimer) clearTimeout(infoWarningTimer);
+    el.textContent = msg;
+    infoWarningTimer = setTimeout(function(){
+      el.textContent = mode==='earth'
+        ? 'Drag to rotate • Pinch to zoom • Tap Sun or Moon for info'
+        : 'Drag to orbit • Pinch to zoom • Tap Sun or a planet for info';
+    }, ms || 6000);
   }
 
   // ---------------- SOLAR SYSTEM VIEW ----------------
@@ -442,6 +469,14 @@
       }
       cloudMesh.rotation.y += 0.00006;
       if(windAnimHandleActive){ stepWindParticles(); }
+      if(overlayMeshes['pressure']){
+        // "Breathing" pulse — pressure systems aren't static, so give the layer a slow
+        // sine-wave pulse in size/opacity rather than sitting as flat dots.
+        var t = performance.now() * 0.001;
+        var breathe = 0.5 + 0.5*Math.sin(t * 0.5); // ~12.5s full cycle
+        overlayMeshes['pressure'].material.size = 0.028 + breathe*0.022;
+        overlayMeshes['pressure'].material.opacity = 0.55 + breathe*0.4;
+      }
     } else {
       animateSolarMoons();
     }
@@ -596,8 +631,11 @@
         infoEl.textContent = "Drag to rotate • Pinch to zoom";
         markLiveUpdated();
       }).catch(function(err){
-        infoEl.textContent = "Wind data unavailable (offline?)";
         console.error(err);
+        setInfoWarning('Wind failed to load: ' + (err.message || 'network error') + ' — tap Wind again to retry');
+        activeLayers['wind'] = false;
+        document.querySelector('.layer-btn[data-layer="wind"]').classList.remove('active');
+        checkLiveRefreshTimer();
       });
       checkLiveRefreshTimer();
       return;
@@ -607,8 +645,11 @@
       infoEl.textContent = "Drag to rotate • Pinch to zoom";
       markLiveUpdated();
     }).catch(function(err){
-      infoEl.textContent = "Layer unavailable (offline?)";
       console.error(err);
+      setInfoWarning(layer + ' failed to load: ' + (err.message || 'network error') + ' — tap it again to retry');
+      activeLayers[layer] = false;
+      document.querySelector('.layer-btn[data-layer="'+layer+'"]').classList.remove('active');
+      checkLiveRefreshTimer();
     });
     checkLiveRefreshTimer();
   }
@@ -666,22 +707,23 @@
 
   async function enableWindParticles(){
     var grid = buildGridPoints();
-    var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
-              "&longitude=" + grid.lonParam.join(",") +
-              "&current=wind_speed_10m,wind_direction_10m";
-    var res = await fetch(url);
-    var data = await res.json();
-    var list = Array.isArray(data) ? data : [data];
+    var r = await fetchWeatherGrid(grid, 'wind_speed_10m,wind_direction_10m');
+    if(r.failedChunks === r.totalChunks){
+      throw new Error((r.lastError && r.lastError.message) || 'all regions failed');
+    }
+    if(r.failedChunks > 0){
+      setInfoWarning('Wind: ' + r.failedChunks + '/' + r.totalChunks + ' regions failed to load — will retry on next refresh');
+    }
     // Convert speed+compass-direction into simplified eastward(u)/northward(v) components.
     // Meteorological convention: direction is where wind blows FROM, so the flow vector points
     // 180° opposite — this is a simplified conversion for visualization, not navigation-grade.
     var uComp = [], vComp = [], maxSpeed = 0.001;
-    list.forEach(function(d){
-      var spd = d.current ? d.current.wind_speed_10m : 0;
-      var dir = d.current ? d.current.wind_direction_10m : 0;
-      var rad = (dir+180) * Math.PI/180;
-      uComp.push(spd * Math.sin(rad));
-      vComp.push(spd * Math.cos(rad));
+    r.results.forEach(function(d){
+      var spd = d ? d.wind_speed_10m : 0;
+      var dir = d ? d.wind_direction_10m : 0;
+      var rad = ((dir||0)+180) * Math.PI/180;
+      uComp.push((spd||0) * Math.sin(rad));
+      vComp.push((spd||0) * Math.cos(rad));
       if(spd > maxSpeed) maxSpeed = spd;
     });
 
@@ -726,20 +768,16 @@
   async function refreshWindVectors(){
     if(!windParticles) return;
     var grid = windParticles.grid;
-    var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
-              "&longitude=" + grid.lonParam.join(",") +
-              "&current=wind_speed_10m,wind_direction_10m";
     try{
-      var res = await fetch(url);
-      var data = await res.json();
-      var list = Array.isArray(data) ? data : [data];
+      var r = await fetchWeatherGrid(grid, 'wind_speed_10m,wind_direction_10m');
+      if(r.failedChunks === r.totalChunks) throw new Error('all regions failed');
       var uComp = [], vComp = [], maxSpeed = 0.001;
-      list.forEach(function(d){
-        var spd = d.current ? d.current.wind_speed_10m : 0;
-        var dir = d.current ? d.current.wind_direction_10m : 0;
-        var rad = (dir+180) * Math.PI/180;
-        uComp.push(spd * Math.sin(rad));
-        vComp.push(spd * Math.cos(rad));
+      r.results.forEach(function(d){
+        var spd = d ? d.wind_speed_10m : 0;
+        var dir = d ? d.wind_direction_10m : 0;
+        var rad = ((dir||0)+180) * Math.PI/180;
+        uComp.push((spd||0) * Math.sin(rad));
+        vComp.push((spd||0) * Math.cos(rad));
         if(spd > maxSpeed) maxSpeed = spd;
       });
       // Swap in place — particles already in flight keep moving, just get steered by fresh data
@@ -747,7 +785,10 @@
       windParticles.uComp = uComp;
       windParticles.vComp = vComp;
       windParticles.maxSpeed = maxSpeed;
-    } catch(err){ console.error('wind refresh failed', err); }
+    } catch(err){
+      console.error('wind refresh failed', err);
+      setInfoWarning('Wind refresh failed — will retry in 10 min');
+    }
   }
 
   function stepWindParticles(){
@@ -825,13 +866,49 @@
   };
 
   function buildGridPoints(){
-    var step = 12;
+    var step = 15; // coarser than before — fewer points per request, more reliable on mobile networks
     var lats = [], lons = [];
-    for(var la=-84; la<=84; la+=step) lats.push(la);
+    for(var la=-75; la<=75; la+=step) lats.push(la);
     for(var lo=-180; lo<180; lo+=step) lons.push(lo);
     var latParam = [], lonParam = [];
     lats.forEach(function(la){ lons.forEach(function(lo){ latParam.push(la); lonParam.push(lo); }); });
     return {latParam:latParam, lonParam:lonParam};
+  }
+
+  // Fetches a weather field across the grid in small parallel batches instead of one huge request —
+  // a single 400+ point request is fragile on real mobile connections (URL size, timeouts). Batching
+  // means a failed chunk only costs you that region, not the whole layer, and failures are reported
+  // instead of silently swallowed.
+  async function fetchWeatherGrid(grid, fieldsCsv, timeoutMs){
+    var chunkSize = 40;
+    var chunks = [];
+    for(var i=0;i<grid.latParam.length;i+=chunkSize){
+      chunks.push({ lat:grid.latParam.slice(i,i+chunkSize), lon:grid.lonParam.slice(i,i+chunkSize), offset:i });
+    }
+    var results = new Array(grid.latParam.length).fill(null);
+    var failedChunks = 0, lastError = null;
+
+    await Promise.all(chunks.map(async function(chunk){
+      var controller = new AbortController();
+      var timer = setTimeout(function(){ controller.abort(); }, timeoutMs || 9000);
+      try{
+        var url = "https://api.open-meteo.com/v1/forecast?latitude=" + chunk.lat.join(",") +
+                  "&longitude=" + chunk.lon.join(",") + "&current=" + fieldsCsv;
+        var res = await fetch(url, {signal: controller.signal});
+        if(!res.ok) throw new Error('HTTP ' + res.status);
+        var data = await res.json();
+        var list = Array.isArray(data) ? data : [data];
+        list.forEach(function(d, idx){ results[chunk.offset+idx] = d.current || null; });
+      } catch(err){
+        failedChunks++;
+        lastError = err;
+        console.error('weather chunk failed', err);
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+
+    return { results:results, failedChunks:failedChunks, totalChunks:chunks.length, lastError:lastError };
   }
 
   async function buildOverlayGrid(layer, valuesOverride){
@@ -840,13 +917,14 @@
     if(valuesOverride){
       values = valuesOverride;
     } else {
-      var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
-                "&longitude=" + grid.lonParam.join(",") +
-                "&current=" + FIELD_MAP[layer];
-      var res = await fetch(url);
-      var data = await res.json();
-      var list = Array.isArray(data) ? data : [data];
-      values = list.map(function(d){ return d.current ? d.current[FIELD_MAP[layer]] : null; });
+      var r = await fetchWeatherGrid(grid, FIELD_MAP[layer]);
+      if(r.failedChunks === r.totalChunks){
+        throw new Error((r.lastError && r.lastError.message) || 'all regions failed');
+      }
+      if(r.failedChunks > 0){
+        setInfoWarning(layer + ': ' + r.failedChunks + '/' + r.totalChunks + ' regions failed to load — will retry on next refresh');
+      }
+      values = r.results.map(function(d){ return d ? d[FIELD_MAP[layer]] : null; });
     }
     renderGrid(layer, grid, values);
   }
