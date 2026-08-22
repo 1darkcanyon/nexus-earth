@@ -437,6 +437,7 @@
         Object.keys(overlayMeshes).forEach(function(k){ overlayMeshes[k].rotation.y += rotateSpeed; });
       }
       cloudMesh.rotation.y += 0.00006;
+      if(windAnimHandleActive){ stepWindParticles(); }
     } else {
       animateSolarMoons();
     }
@@ -579,10 +580,21 @@
   function disableLayer(layer){
     activeLayers[layer] = false;
     if(overlayMeshes[layer]){ scene.remove(overlayMeshes[layer]); delete overlayMeshes[layer]; }
+    if(layer === 'wind'){ disableWindParticles(); }
   }
 
   function enableLayer(layer){
     var infoEl = document.getElementById('info');
+    if(layer === 'wind'){
+      infoEl.textContent = "Loading wind vector data…";
+      enableWindParticles().then(function(){
+        infoEl.textContent = "Drag to rotate • Pinch to zoom";
+      }).catch(function(err){
+        infoEl.textContent = "Wind data unavailable (offline?)";
+        console.error(err);
+      });
+      return;
+    }
     infoEl.textContent = "Loading " + layer + " data…";
     buildOverlayGrid(layer, null).then(function(){
       infoEl.textContent = "Drag to rotate • Pinch to zoom";
@@ -590,6 +602,134 @@
       infoEl.textContent = "Layer unavailable (offline?)";
       console.error(err);
     });
+  }
+
+  // ---------------- Wind particle flow (adapted from ParticleFlow's physics loop) ----------------
+  // Canonical order carried over from the ParticleFlow app:
+  //   velocity += acceleration  ->  position += velocity  ->  color from velocity  ->  velocity *= drag
+  // Here "acceleration" each frame steers a particle's velocity toward the real wind vector
+  // sampled at its location, "drag" keeps speeds bounded, and color encodes speed exactly like
+  // ParticleFlow's cymatic/attractor visuals do.
+  var windParticles = null;      // {geo, mesh, particles:[{lat,lon,vLat,vLon,age,life}], grid, uComp, vComp}
+  var WIND_PARTICLE_COUNT = 700;
+  var windAnimHandleActive = false;
+
+  function windVectorAt(lat, lon, grid, uComp, vComp){
+    // Nearest-neighbor lookup on the coarse sample grid (fast, good enough at this resolution).
+    var best = 0, bestDist = Infinity;
+    for(var i=0;i<grid.latParam.length;i++){
+      var dlat = grid.latParam[i]-lat, dlon = grid.lonParam[i]-lon;
+      var d = dlat*dlat + dlon*dlon;
+      if(d < bestDist){ bestDist = d; best = i; }
+    }
+    return { u: uComp[best]||0, v: vComp[best]||0 };
+  }
+
+  async function enableWindParticles(){
+    var grid = buildGridPoints();
+    var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
+              "&longitude=" + grid.lonParam.join(",") +
+              "&current=wind_speed_10m,wind_direction_10m";
+    var res = await fetch(url);
+    var data = await res.json();
+    var list = Array.isArray(data) ? data : [data];
+    // Convert speed+compass-direction into simplified eastward(u)/northward(v) components.
+    // Meteorological convention: direction is where wind blows FROM, so the flow vector points
+    // 180° opposite — this is a simplified conversion for visualization, not navigation-grade.
+    var uComp = [], vComp = [], maxSpeed = 0.001;
+    list.forEach(function(d){
+      var spd = d.current ? d.current.wind_speed_10m : 0;
+      var dir = d.current ? d.current.wind_direction_10m : 0;
+      var rad = (dir+180) * Math.PI/180;
+      uComp.push(spd * Math.sin(rad));
+      vComp.push(spd * Math.cos(rad));
+      if(spd > maxSpeed) maxSpeed = spd;
+    });
+
+    var particles = [];
+    for(var i=0;i<WIND_PARTICLE_COUNT;i++){
+      particles.push(spawnWindParticle());
+    }
+
+    var posArr = new Float32Array(WIND_PARTICLE_COUNT*3);
+    var colArr = new Float32Array(WIND_PARTICLE_COUNT*3);
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(posArr,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colArr,3));
+    var mat = new THREE.PointsMaterial({size:0.02, vertexColors:true, transparent:true, opacity:0.95, depthWrite:false});
+    var mesh = new THREE.Points(geo, mat);
+    mesh.rotation.copy(globe.rotation);
+    scene.add(mesh);
+
+    windParticles = { geo:geo, mesh:mesh, particles:particles, grid:grid, uComp:uComp, vComp:vComp, maxSpeed:maxSpeed };
+    overlayMeshes['wind'] = mesh; // so drag-rotation sync + clear-all still pick it up
+    windAnimHandleActive = true;
+  }
+
+  function spawnWindParticle(){
+    return {
+      lat: -80 + Math.random()*160,
+      lon: -180 + Math.random()*360,
+      vLat: 0, vLon: 0,
+      age: 0, life: 120 + Math.random()*120
+    };
+  }
+
+  function disableWindParticles(){
+    windAnimHandleActive = false;
+    if(windParticles){
+      scene.remove(windParticles.mesh);
+      windParticles = null;
+    }
+    delete overlayMeshes['wind'];
+  }
+
+  function stepWindParticles(){
+    if(!windParticles) return;
+    var wp = windParticles;
+    var pos = wp.geo.attributes.position.array;
+    var col = wp.geo.attributes.color.array;
+    var dragFactor = 0.90;
+    var accelFactor = 0.18;
+    var speedScale = 0.012; // degrees per frame per unit wind speed
+
+    for(var i=0;i<wp.particles.length;i++){
+      var p = wp.particles[i];
+      var wind = windVectorAt(p.lat, p.lon, wp.grid, wp.uComp, wp.vComp);
+      var targetVLon = wind.u * speedScale;
+      var targetVLat = wind.v * speedScale;
+
+      // velocity += acceleration  (steer current velocity toward the real wind vector)
+      p.vLon += (targetVLon - p.vLon) * accelFactor;
+      p.vLat += (targetVLat - p.vLat) * accelFactor;
+
+      // position += velocity
+      p.lon += p.vLon;
+      p.lat += p.vLat;
+
+      // velocity *= drag
+      p.vLon *= dragFactor;
+      p.vLat *= dragFactor;
+
+      p.age++;
+      if(p.age > p.life || p.lat > 85 || p.lat < -85){
+        var fresh = spawnWindParticle();
+        p.lat = fresh.lat; p.lon = fresh.lon; p.vLat = 0; p.vLon = 0; p.age = 0; p.life = fresh.life;
+      }
+      if(p.lon > 180) p.lon -= 360;
+      if(p.lon < -180) p.lon += 360;
+
+      var v3 = latLonToVec3(p.lat, p.lon, 1.02);
+      pos[i*3] = v3.x; pos[i*3+1] = v3.y; pos[i*3+2] = v3.z;
+
+      // color from velocity (speed) — same principle as ParticleFlow's velocity-driven color
+      var speed = Math.sqrt(p.vLat*p.vLat + p.vLon*p.vLon) / speedScale;
+      var norm = Math.min(speed / wp.maxSpeed, 1);
+      var c = colorForValue('wind', norm);
+      col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    }
+    wp.geo.attributes.position.needsUpdate = true;
+    wp.geo.attributes.color.needsUpdate = true;
   }
 
   function latLonToVec3(lat, lon, radius){
@@ -676,7 +816,9 @@
   // ---------------- Forecast playback (real Open-Meteo hourly forecast, ~48h) ----------------
   // Plays back every layer that's currently toggled on, in sync.
   async function startForecast(){
-    var layers = Object.keys(activeLayers).filter(function(l){ return activeLayers[l]; });
+    // Wind is now a live particle flow (real-time, continuously animated) rather than a
+    // static snapshot, so it's excluded from hourly forecast playback.
+    var layers = Object.keys(activeLayers).filter(function(l){ return activeLayers[l] && l !== 'wind'; });
     if(!layers.length){
       document.getElementById('info').textContent = 'Turn on at least one layer (Temp/Precip/etc) before playing the forecast';
       return;
