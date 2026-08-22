@@ -51,6 +51,7 @@
   <div class="layer-btn" id="playBtn">▶ Forecast</div>
 </div>
 <div id="info">Drag to rotate • Pinch to zoom • Tap Sun or planets for info</div>
+<div id="liveUpdated" style="position:absolute; bottom:env(safe-area-inset-bottom,68px); left:0; right:0; text-align:center; color:#8fdca0; font-family:sans-serif; font-size:10px; z-index:10; pointer-events:none;"></div>
 <div id="forecastBar"></div>
 <div id="panel"><span class="close">✕</span><div id="panelBody"></div></div>
 
@@ -63,6 +64,9 @@
   var autoRotate = true;
   var activeLayers = {}; // layer -> true if currently toggled on
   var overlayMeshes = {}; // layer -> THREE.Points mesh
+  var LIVE_REFRESH_MS = 10 * 60 * 1000; // Open-Meteo's underlying models update roughly hourly;
+                                          // 10 min keeps things current without hammering the API.
+  var liveRefreshTimer = null;
   var mode = "earth"; // "earth" | "solar"
   var solarGroup = null;
   var planetMeshes = {}; // key -> {mesh, data}
@@ -581,6 +585,7 @@
     activeLayers[layer] = false;
     if(overlayMeshes[layer]){ scene.remove(overlayMeshes[layer]); delete overlayMeshes[layer]; }
     if(layer === 'wind'){ disableWindParticles(); }
+    checkLiveRefreshTimer();
   }
 
   function enableLayer(layer){
@@ -589,19 +594,53 @@
       infoEl.textContent = "Loading wind vector data…";
       enableWindParticles().then(function(){
         infoEl.textContent = "Drag to rotate • Pinch to zoom";
+        markLiveUpdated();
       }).catch(function(err){
         infoEl.textContent = "Wind data unavailable (offline?)";
         console.error(err);
       });
+      checkLiveRefreshTimer();
       return;
     }
     infoEl.textContent = "Loading " + layer + " data…";
     buildOverlayGrid(layer, null).then(function(){
       infoEl.textContent = "Drag to rotate • Pinch to zoom";
+      markLiveUpdated();
     }).catch(function(err){
       infoEl.textContent = "Layer unavailable (offline?)";
       console.error(err);
     });
+    checkLiveRefreshTimer();
+  }
+
+  // Keeps whichever layers are toggled on fetching fresh data every LIVE_REFRESH_MS,
+  // so leaving the app open doesn't leave you looking at a stale snapshot.
+  function checkLiveRefreshTimer(){
+    var anyActive = Object.keys(activeLayers).some(function(l){ return activeLayers[l]; });
+    if(anyActive && !liveRefreshTimer){
+      liveRefreshTimer = setInterval(refreshAllActiveLayers, LIVE_REFRESH_MS);
+    } else if(!anyActive && liveRefreshTimer){
+      clearInterval(liveRefreshTimer);
+      liveRefreshTimer = null;
+      document.getElementById('liveUpdated').textContent = '';
+    }
+  }
+
+  function refreshAllActiveLayers(){
+    if(forecastPlaying) return; // don't fight with forecast playback
+    Object.keys(activeLayers).forEach(function(layer){
+      if(!activeLayers[layer]) return;
+      if(layer === 'wind'){ refreshWindVectors(); }
+      else { buildOverlayGrid(layer, null).catch(function(){}); }
+    });
+    markLiveUpdated();
+  }
+
+  function markLiveUpdated(){
+    var now = new Date();
+    var hh = String(now.getHours()).padStart(2,'0');
+    var mm = String(now.getMinutes()).padStart(2,'0');
+    document.getElementById('liveUpdated').textContent = '● Live — updated ' + hh + ':' + mm + ' (auto-refreshes every 10 min)';
   }
 
   // ---------------- Wind particle flow (adapted from ParticleFlow's physics loop) ----------------
@@ -682,6 +721,33 @@
       windParticles = null;
     }
     delete overlayMeshes['wind'];
+  }
+
+  async function refreshWindVectors(){
+    if(!windParticles) return;
+    var grid = windParticles.grid;
+    var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
+              "&longitude=" + grid.lonParam.join(",") +
+              "&current=wind_speed_10m,wind_direction_10m";
+    try{
+      var res = await fetch(url);
+      var data = await res.json();
+      var list = Array.isArray(data) ? data : [data];
+      var uComp = [], vComp = [], maxSpeed = 0.001;
+      list.forEach(function(d){
+        var spd = d.current ? d.current.wind_speed_10m : 0;
+        var dir = d.current ? d.current.wind_direction_10m : 0;
+        var rad = (dir+180) * Math.PI/180;
+        uComp.push(spd * Math.sin(rad));
+        vComp.push(spd * Math.cos(rad));
+        if(spd > maxSpeed) maxSpeed = spd;
+      });
+      // Swap in place — particles already in flight keep moving, just get steered by fresh data
+      // on their next integration step instead of jumping/resetting.
+      windParticles.uComp = uComp;
+      windParticles.vComp = vComp;
+      windParticles.maxSpeed = maxSpeed;
+    } catch(err){ console.error('wind refresh failed', err); }
   }
 
   function stepWindParticles(){
