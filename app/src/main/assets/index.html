@@ -31,6 +31,18 @@
   #panel .close { position:absolute; top:8px; right:12px; color:#aaa; font-size:18px; }
   #panel .note { color:#8fa; font-size:11px; margin-top:8px; }
   #panel .cme { border-top:1px solid rgba(255,255,255,0.15); padding-top:6px; margin-top:6px; }
+  .nexus-legend {
+    position: absolute; bottom: 84px; left: 12px; z-index: 10;
+    background: rgba(10, 14, 20, 0.75); backdrop-filter: blur(6px); border-radius: 10px;
+    padding: 8px 10px; font-family: sans-serif; font-size: 11px; color: #e8ecf1;
+    max-width: 190px; pointer-events: none;
+  }
+  .nexus-legend h4 { margin: 0 0 5px; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; opacity: 0.7; }
+  .nexus-legend-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  .nexus-legend-swatch { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .nexus-legend-block { display: none; margin-bottom: 7px; }
+  .nexus-legend-block.active { display: block; }
+  .nexus-legend-block:last-child { margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -48,11 +60,29 @@
   <div class="layer-btn" data-layer="clouds">Clouds</div>
   <div class="layer-btn" data-layer="pressure">Pressure</div>
   <div class="layer-btn" data-layer="wind">Wind</div>
+  <div class="layer-btn" data-layer="buoy">Buoys</div>
+  <div class="layer-btn" data-layer="fire">Fires</div>
+  <div class="layer-btn" data-layer="lightning">Lightning</div>
   <div class="layer-btn" id="playBtn">▶ Forecast</div>
 </div>
 <div id="info">Drag to rotate • Pinch to zoom • Tap Sun or planets for info</div>
 <div id="liveUpdated" style="position:absolute; bottom:env(safe-area-inset-bottom,68px); left:0; right:0; text-align:center; color:#8fdca0; font-family:sans-serif; font-size:10px; z-index:10; pointer-events:none;"></div>
 <div id="forecastBar"></div>
+<div class="nexus-legend" id="nexus-legend">
+  <div class="nexus-legend-block" id="legend-buoy">
+    <h4>Buoy — Wave Height</h4>
+    <div class="nexus-legend-row"><span class="nexus-legend-swatch" style="background:#33ccff"></span><span>&lt; 3 m</span></div>
+    <div class="nexus-legend-row"><span class="nexus-legend-swatch" style="background:#ff5533"></span><span>&ge; 3 m (rough)</span></div>
+  </div>
+  <div class="nexus-legend-block" id="legend-fire">
+    <h4>Fire — VIIRS Detections</h4>
+    <div class="nexus-legend-row"><span class="nexus-legend-swatch" style="background:#ff4400"></span><span>Active detection (24h)</span></div>
+  </div>
+  <div class="nexus-legend-block" id="legend-lightning">
+    <h4>Lightning — Live Strikes</h4>
+    <div class="nexus-legend-row"><span class="nexus-legend-swatch" style="background:#ffffaa"></span><span>Strike (fades ~1.2s)</span></div>
+  </div>
+</div>
 <div id="panel"><span class="close">✕</span><div id="panelBody"></div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -358,6 +388,7 @@
         Object.keys(overlayMeshes).forEach(function(k){
           overlayMeshes[k].rotation.y = lon; overlayMeshes[k].rotation.x = lat;
         });
+        if(lightningGroup){ lightningGroup.rotation.y = lon; lightningGroup.rotation.x = lat; }
       } else {
         solarGroup.rotation.y += dx*0.004;
         solarGroup.rotation.x += dy*0.004;
@@ -466,6 +497,7 @@
         globe.rotation.y += rotateSpeed;
         cloudMesh.rotation.y += rotateSpeed;
         Object.keys(overlayMeshes).forEach(function(k){ overlayMeshes[k].rotation.y += rotateSpeed; });
+        if(lightningGroup){ lightningGroup.rotation.y += rotateSpeed; }
       }
       cloudMesh.rotation.y += 0.00006;
       if(windAnimHandleActive){ stepWindParticles(); }
@@ -477,6 +509,7 @@
         overlayMeshes['pressure'].material.size = 0.028 + breathe*0.022;
         overlayMeshes['pressure'].material.opacity = 0.55 + breathe*0.4;
       }
+      if(lightningGroup){ updateLightningPulses(); }
     } else {
       animateSolarMoons();
     }
@@ -620,6 +653,9 @@
     activeLayers[layer] = false;
     if(overlayMeshes[layer]){ scene.remove(overlayMeshes[layer]); delete overlayMeshes[layer]; }
     if(layer === 'wind'){ disableWindParticles(); }
+    if(layer === 'buoy'){ disableBuoyLayer(); }
+    if(layer === 'fire'){ disableFireLayer(); }
+    if(layer === 'lightning'){ disableLightningLayer(); }
     checkLiveRefreshTimer();
   }
 
@@ -640,6 +676,48 @@
       checkLiveRefreshTimer();
       return;
     }
+    if(layer === 'buoy'){
+      infoEl.textContent = "Loading buoy data…";
+      showLegend('buoy', true);
+      refreshBuoyLayer().then(function(){
+        infoEl.textContent = "Drag to rotate • Pinch to zoom";
+        markLiveUpdated();
+      }).catch(function(err){
+        console.error(err);
+        setInfoWarning('Buoy data failed: ' + (err.message || 'network error') + ' — tap Buoys again to retry');
+        activeLayers['buoy'] = false;
+        document.querySelector('.layer-btn[data-layer="buoy"]').classList.remove('active');
+        showLegend('buoy', false);
+        checkLiveRefreshTimer();
+      });
+      checkLiveRefreshTimer();
+      return;
+    }
+    if(layer === 'fire'){
+      infoEl.textContent = "Loading fire detection data…";
+      showLegend('fire', true);
+      refreshFireLayer().then(function(){
+        infoEl.textContent = "Drag to rotate • Pinch to zoom";
+        markLiveUpdated();
+      }).catch(function(err){
+        console.error(err);
+        setInfoWarning('Fire data failed: ' + (err.message || 'network error, or missing FIRMS_MAP_KEY') + ' — tap Fires again to retry');
+        activeLayers['fire'] = false;
+        document.querySelector('.layer-btn[data-layer="fire"]').classList.remove('active');
+        showLegend('fire', false);
+        checkLiveRefreshTimer();
+      });
+      checkLiveRefreshTimer();
+      return;
+    }
+    if(layer === 'lightning'){
+      infoEl.textContent = "Connecting to lightning feed…";
+      showLegend('lightning', true);
+      enableLightningLayer();
+      infoEl.textContent = "Drag to rotate • Pinch to zoom";
+      checkLiveRefreshTimer();
+      return;
+    }
     infoEl.textContent = "Loading " + layer + " data…";
     buildOverlayGrid(layer, null).then(function(){
       infoEl.textContent = "Drag to rotate • Pinch to zoom";
@@ -652,6 +730,11 @@
       checkLiveRefreshTimer();
     });
     checkLiveRefreshTimer();
+  }
+
+  function showLegend(layerName, active){
+    var el = document.getElementById('legend-' + layerName);
+    if(el) el.classList.toggle('active', active);
   }
 
   // Keeps whichever layers are toggled on fetching fresh data every LIVE_REFRESH_MS,
@@ -672,6 +755,9 @@
     Object.keys(activeLayers).forEach(function(layer){
       if(!activeLayers[layer]) return;
       if(layer === 'wind'){ refreshWindVectors(); }
+      else if(layer === 'buoy'){ refreshBuoyLayer().catch(function(){}); }
+      else if(layer === 'fire'){ refreshFireLayer().catch(function(){}); }
+      else if(layer === 'lightning'){ /* lightning is a live socket, nothing to poll */ }
       else { buildOverlayGrid(layer, null).catch(function(){}); }
     });
     markLiveUpdated();
@@ -955,14 +1041,238 @@
   }
 
   // When multiple layers are on at once, stack their point shells slightly apart so they don't z-fight.
-  var LAYER_SHELL_OFFSET = { temp:0, precip:0.01, clouds:0.02, pressure:0.03, wind:0.04 };
+  var LAYER_SHELL_OFFSET = { temp:0, precip:0.01, clouds:0.02, pressure:0.03, wind:0.04, buoy:0.05, fire:0.06 };
+
+  // ---------------- BUOY LAYER — NOAA National Data Buoy Center (NDBC) ----------------
+  // Free, no API key. Station metadata (lat/lon) from the active-station table;
+  // per-station realtime readings from the realtime2 text feed.
+  var buoyStationCache = null; // [{id,lat,lon}] — fetched once, reused across refreshes
+  var BUOY_MAX_STATIONS = 50; // keep it light for a mobile GPU/network
+
+  async function loadBuoyStationList(){
+    var res = await fetch("https://www.ndbc.noaa.gov/activestations.xml");
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    var text = await res.text();
+    var xml = new DOMParser().parseFromString(text, "text/xml");
+    var stations = Array.from(xml.getElementsByTagName("station"))
+      .map(function(s){
+        return { id: s.getAttribute("id"), lat: parseFloat(s.getAttribute("lat")), lon: parseFloat(s.getAttribute("lon")) };
+      })
+      .filter(function(s){ return !isNaN(s.lat) && !isNaN(s.lon); });
+    // Simple spread: take an evenly-spaced sample across the full list rather than just the first N,
+    // so stations aren't all clustered in one alphabetical/geographic block.
+    var step = Math.max(1, Math.floor(stations.length / BUOY_MAX_STATIONS));
+    var sampled = [];
+    for(var i=0;i<stations.length && sampled.length<BUOY_MAX_STATIONS;i+=step) sampled.push(stations[i]);
+    return sampled;
+  }
+
+  function parseNdbcRealtime(text){
+    var lines = text.trim().split("\n").filter(function(l){ return l.indexOf('#')!==0; });
+    if(!lines.length) return null;
+    var cols = lines[0].trim().split(/\s+/);
+    var val = function(i){ return cols[i]==='MM' ? null : parseFloat(cols[i]); };
+    return { waveHeight: val(8), pressure: val(12), airTemp: val(13), waterTemp: val(14) };
+  }
+
+  async function refreshBuoyLayer(){
+    if(!buoyStationCache){
+      buoyStationCache = await loadBuoyStationList();
+    }
+    var chunkSize = 10;
+    var positions = [], colors = [];
+    var successCount = 0;
+
+    for(var i=0;i<buoyStationCache.length;i+=chunkSize){
+      var chunk = buoyStationCache.slice(i, i+chunkSize);
+      await Promise.all(chunk.map(async function(station){
+        try{
+          var controller = new AbortController();
+          var timer = setTimeout(function(){ controller.abort(); }, 6000);
+          var res = await fetch("https://www.ndbc.noaa.gov/data/realtime2/" + station.id + ".txt", {signal:controller.signal});
+          clearTimeout(timer);
+          if(!res.ok) throw new Error('HTTP ' + res.status);
+          var text = await res.text();
+          var reading = parseNdbcRealtime(text);
+          if(!reading) return;
+          var p = latLonToVec3(station.lat, station.lon, 1.02 + LAYER_SHELL_OFFSET.buoy);
+          positions.push(p.x, p.y, p.z);
+          var rough = (reading.waveHeight||0) >= 3;
+          var col = new THREE.Color(rough ? 0xff5533 : 0x33ccff);
+          colors.push(col.r, col.g, col.b);
+          successCount++;
+        } catch(err){ /* skip this station, keep going */ }
+      }));
+    }
+
+    if(successCount === 0){
+      throw new Error('no buoy stations responded');
+    }
+
+    if(overlayMeshes['buoy']){ scene.remove(overlayMeshes['buoy']); }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+    var mat = new THREE.PointsMaterial({size:0.045, vertexColors:true, transparent:true, opacity:0.95, depthWrite:false});
+    var mesh = new THREE.Points(geo, mat);
+    mesh.rotation.copy(globe.rotation);
+    scene.add(mesh);
+    overlayMeshes['buoy'] = mesh;
+  }
+
+  function disableBuoyLayer(){
+    showLegend('buoy', false);
+  }
+
+  // ---------------- FIRE LAYER — NASA FIRMS (VIIRS active fire detections) ----------------
+  // Free API, requires a MAP_KEY — register at https://firms.modis.nasa.gov/api/map_key/
+  var FIRMS_MAP_KEY = "YOUR_FIRMS_MAP_KEY"; // <-- put your free FIRMS key here
+
+  async function refreshFireLayer(){
+    if(FIRMS_MAP_KEY === "YOUR_FIRMS_MAP_KEY"){
+      throw new Error('FIRMS_MAP_KEY not set — register a free key and paste it in');
+    }
+    var url = "https://firms.modis.nasa.gov/api/area/csv/" + FIRMS_MAP_KEY + "/VIIRS_SNPP_NRT/world/1";
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 12000);
+    var res;
+    try{
+      res = await fetch(url, {signal:controller.signal});
+    } finally { clearTimeout(timer); }
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    var csv = await res.text();
+
+    var rows = csv.trim().split("\n");
+    if(rows.length < 2) throw new Error('no detections returned');
+    var header = rows[0].split(",");
+    var latIdx = header.indexOf("latitude");
+    var lonIdx = header.indexOf("longitude");
+    if(latIdx===-1 || lonIdx===-1) throw new Error('unexpected FIRMS response format');
+
+    var maxPoints = 3000;
+    var dataRows = rows.slice(1);
+    var step = Math.max(1, Math.floor(dataRows.length / maxPoints));
+    var positions = [];
+    for(var i=0;i<dataRows.length;i+=step){
+      var cols = dataRows[i].split(",");
+      var lat = parseFloat(cols[latIdx]);
+      var lon = parseFloat(cols[lonIdx]);
+      if(isNaN(lat) || isNaN(lon)) continue;
+      var p = latLonToVec3(lat, lon, 1.02 + LAYER_SHELL_OFFSET.fire);
+      positions.push(p.x, p.y, p.z);
+    }
+
+    if(overlayMeshes['fire']){ scene.remove(overlayMeshes['fire']); }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+    var mat = new THREE.PointsMaterial({color:0xff4400, size:0.03, transparent:true, opacity:0.85, depthWrite:false});
+    var mesh = new THREE.Points(geo, mat);
+    mesh.rotation.copy(globe.rotation);
+    scene.add(mesh);
+    overlayMeshes['fire'] = mesh;
+  }
+
+  function disableFireLayer(){
+    showLegend('fire', false);
+  }
+
+  // ---------------- LIGHTNING LAYER — Blitzortung.org live strike feed ----------------
+  // NOTE: Blitzortung is a free, community-run network with no official public API/ToS for
+  // third-party apps — this websocket relay approach is the common unofficial pattern used by
+  // hobby projects. Fine for personal use; if this ever needs to be commercial-grade/App-Store
+  // reliable, swap for NOAA GOES-16/18 GLM strike-density data or a paid provider.
+  var lightningGroup = null;
+  var lightningSocket = null;
+  var lightningPulses = [];
+  var lightningWantedActive = false;
+
+  function enableLightningLayer(){
+    lightningWantedActive = true;
+    if(!lightningGroup){
+      lightningGroup = new THREE.Group();
+      lightningGroup.rotation.copy(globe.rotation);
+      scene.add(lightningGroup);
+    }
+    connectLightningSocket();
+  }
+
+  function connectLightningSocket(){
+    try{
+      lightningSocket = new WebSocket("wss://ws1.blitzortung.org/");
+      lightningSocket.onopen = function(){
+        lightningSocket.send(JSON.stringify({a:111}));
+      };
+      lightningSocket.onmessage = function(event){
+        try{
+          var strike = JSON.parse(event.data);
+          if(typeof strike.lat !== 'number' || typeof strike.lon !== 'number') return;
+          spawnLightningPulse(strike.lat, strike.lon);
+        } catch(e){ /* ignore malformed frames */ }
+      };
+      lightningSocket.onerror = function(){
+        setInfoWarning('Lightning feed connection error — retrying…');
+      };
+      lightningSocket.onclose = function(){
+        if(lightningWantedActive) setTimeout(connectLightningSocket, 5000);
+      };
+    } catch(err){
+      setInfoWarning('Could not open lightning feed');
+      activeLayers['lightning'] = false;
+      var btn = document.querySelector('.layer-btn[data-layer="lightning"]');
+      if(btn) btn.classList.remove('active');
+      disableLightningLayer();
+    }
+  }
+
+  function spawnLightningPulse(lat, lon){
+    if(!lightningGroup) return;
+    var pos = latLonToVec3(lat, lon, 1.025);
+    var flash = new THREE.Mesh(
+      new THREE.SphereGeometry(0.01, 8, 8),
+      new THREE.MeshBasicMaterial({color:0xffffaa, transparent:true, opacity:1})
+    );
+    flash.position.copy(pos);
+    flash.userData.birth = performance.now();
+    lightningGroup.add(flash);
+    lightningPulses.push(flash);
+  }
+
+  function updateLightningPulses(){
+    if(!lightningPulses.length) return;
+    var now = performance.now();
+    var lifespan = 1200;
+    lightningPulses = lightningPulses.filter(function(flash){
+      var age = now - flash.userData.birth;
+      if(age > lifespan){
+        lightningGroup.remove(flash);
+        return false;
+      }
+      var t = age / lifespan;
+      flash.material.opacity = 1 - t;
+      flash.scale.setScalar(1 + t*2);
+      return true;
+    });
+  }
+
+  function disableLightningLayer(){
+    lightningWantedActive = false;
+    if(lightningSocket){ lightningSocket.close(); lightningSocket = null; }
+    if(lightningGroup){
+      scene.remove(lightningGroup);
+      lightningGroup = null;
+      lightningPulses = [];
+    }
+    showLegend('lightning', false);
+  }
 
   // ---------------- Forecast playback (real Open-Meteo hourly forecast, ~48h) ----------------
   // Plays back every layer that's currently toggled on, in sync.
   async function startForecast(){
-    // Wind is now a live particle flow (real-time, continuously animated) rather than a
-    // static snapshot, so it's excluded from hourly forecast playback.
-    var layers = Object.keys(activeLayers).filter(function(l){ return activeLayers[l] && l !== 'wind'; });
+    // Wind, buoy, fire, and lightning are all live/real-time sources without an hourly forecast
+    // field, so playback covers only the grid-based climate layers.
+    var layers = Object.keys(activeLayers).filter(function(l){
+      return activeLayers[l] && FIELD_MAP[l];
+    });
     if(!layers.length){
       document.getElementById('info').textContent = 'Turn on at least one layer (Temp/Precip/etc) before playing the forecast';
       return;
