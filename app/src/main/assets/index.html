@@ -663,15 +663,10 @@
       '<h3>Forecast — ' + lat.toFixed(1) + '°, ' + lon.toFixed(1) + '°</h3><div>Loading 7-day forecast…</div>';
     document.getElementById('panel').style.display = 'block';
     try{
-      var controller = new AbortController();
-      var timer = setTimeout(function(){controller.abort();}, 9000);
       var url = "https://api.open-meteo.com/v1/forecast?latitude=" + lat.toFixed(3) + "&longitude=" + lon.toFixed(3) +
                 "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max" +
                 "&current=temperature_2m,weather_code&timezone=auto&forecast_days=7";
-      var res = await fetch(url, {signal: controller.signal});
-      clearTimeout(timer);
-      if(!res.ok) throw new Error('HTTP ' + res.status);
-      var data = await res.json();
+      var data = await throttledFetchJson(url, 9000);
       var d = data.daily;
       var html = '<h3>Forecast — ' + lat.toFixed(1) + '°, ' + lon.toFixed(1) + '°</h3>';
       if(data.current){
@@ -1046,8 +1041,60 @@
   // a single 400+ point request is fragile on real mobile connections (URL size, timeouts). Batching
   // means a failed chunk only costs you that region, not the whole layer, and failures are reported
   // instead of silently swallowed.
+  // ---------------- Shared request throttle (fixes HTTP 429 from Open-Meteo) ----------------
+  // Every weather fetch in the app funnels through here. Without this, turning on multiple
+  // layers (or a manual retry landing on top of the 10-min auto-refresh) could fire a dozen+
+  // requests at once, which is exactly what trips Open-Meteo's rate limiting. This caps how
+  // many requests are ever in flight at once, queues the rest, and auto-retries on a 429 with
+  // backoff instead of just failing and asking the person to tap again.
+  var MAX_CONCURRENT_FETCHES = 3;
+  var activeFetchCount = 0;
+  var fetchQueue = [];
+
+  function runQueuedFetch(){
+    if(activeFetchCount >= MAX_CONCURRENT_FETCHES || !fetchQueue.length) return;
+    var job = fetchQueue.shift();
+    activeFetchCount++;
+    job().finally(function(){
+      activeFetchCount--;
+      runQueuedFetch();
+    });
+  }
+
+  function throttledFetchJson(url, timeoutMs){
+    return new Promise(function(resolve, reject){
+      fetchQueue.push(async function(){
+        var maxRetries = 2;
+        for(var attempt=0; attempt<=maxRetries; attempt++){
+          var controller = new AbortController();
+          var timer = setTimeout(function(){ controller.abort(); }, timeoutMs || 9000);
+          try{
+            var res = await fetch(url, {signal: controller.signal});
+            clearTimeout(timer);
+            if(res.status === 429){
+              if(attempt < maxRetries){
+                var backoff = 1500 * Math.pow(2, attempt); // 1.5s, 3s
+                await new Promise(function(r){ setTimeout(r, backoff); });
+                continue;
+              }
+              throw new Error('HTTP 429 (rate limited) after retries');
+            }
+            if(!res.ok) throw new Error('HTTP ' + res.status);
+            var data = await res.json();
+            resolve(data);
+            return;
+          } catch(err){
+            clearTimeout(timer);
+            if(attempt >= maxRetries){ reject(err); return; }
+          }
+        }
+      });
+      runQueuedFetch();
+    });
+  }
+
   async function fetchWeatherGrid(grid, fieldsCsv, timeoutMs){
-    var chunkSize = 40;
+    var chunkSize = 90; // fewer, larger chunks -> fewer simultaneous requests -> less rate-limit pressure
     var chunks = [];
     for(var i=0;i<grid.latParam.length;i+=chunkSize){
       chunks.push({ lat:grid.latParam.slice(i,i+chunkSize), lon:grid.lonParam.slice(i,i+chunkSize), offset:i });
@@ -1056,22 +1103,16 @@
     var failedChunks = 0, lastError = null;
 
     await Promise.all(chunks.map(async function(chunk){
-      var controller = new AbortController();
-      var timer = setTimeout(function(){ controller.abort(); }, timeoutMs || 9000);
       try{
         var url = "https://api.open-meteo.com/v1/forecast?latitude=" + chunk.lat.join(",") +
                   "&longitude=" + chunk.lon.join(",") + "&current=" + fieldsCsv;
-        var res = await fetch(url, {signal: controller.signal});
-        if(!res.ok) throw new Error('HTTP ' + res.status);
-        var data = await res.json();
+        var data = await throttledFetchJson(url, timeoutMs);
         var list = Array.isArray(data) ? data : [data];
         list.forEach(function(d, idx){ results[chunk.offset+idx] = d.current || null; });
       } catch(err){
         failedChunks++;
         lastError = err;
         console.error('weather chunk failed', err);
-      } finally {
-        clearTimeout(timer);
       }
     }));
 
@@ -1141,13 +1182,24 @@
       var perLayer = {};
       await Promise.all(layers.map(async function(layer){
         var field = FIELD_MAP[layer];
-        var url = "https://api.open-meteo.com/v1/forecast?latitude=" + grid.latParam.join(",") +
-                  "&longitude=" + grid.lonParam.join(",") +
-                  "&hourly=" + field + "&forecast_hours=48";
-        var res = await fetch(url);
-        var data = await res.json();
-        var list = Array.isArray(data) ? data : [data];
-        perLayer[layer] = { field:field, points:list, times:(list[0]&&list[0].hourly?list[0].hourly.time:[]) };
+        var chunkSize = 90;
+        var chunks = [];
+        for(var i=0;i<grid.latParam.length;i+=chunkSize){
+          chunks.push({ lat:grid.latParam.slice(i,i+chunkSize), lon:grid.lonParam.slice(i,i+chunkSize), offset:i });
+        }
+        var points = new Array(grid.latParam.length).fill(null);
+        var times = null;
+        await Promise.all(chunks.map(async function(chunk){
+          var url = "https://api.open-meteo.com/v1/forecast?latitude=" + chunk.lat.join(",") +
+                    "&longitude=" + chunk.lon.join(",") + "&hourly=" + field + "&forecast_hours=48";
+          var data = await throttledFetchJson(url, 9000);
+          var list = Array.isArray(data) ? data : [data];
+          list.forEach(function(d, idx){
+            points[chunk.offset+idx] = d;
+            if(!times && d.hourly && d.hourly.time) times = d.hourly.time;
+          });
+        }));
+        perLayer[layer] = { field:field, points:points, times: times || [] };
       }));
       forecastData = { grid:grid, layers:perLayer };
       forecastIndex = 0;
@@ -1159,7 +1211,7 @@
       forecastTimer = setInterval(stepForecast, 900);
     } catch(err){
       btn.textContent = '▶ Forecast';
-      document.getElementById('info').textContent = 'Forecast unavailable (offline?)';
+      setInfoWarning('Forecast failed to load: ' + (err.message || 'network error'));
     }
   }
 
