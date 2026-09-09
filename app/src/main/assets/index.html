@@ -48,9 +48,10 @@
   <div class="layer-btn" data-layer="clouds">Clouds</div>
   <div class="layer-btn" data-layer="pressure">Pressure</div>
   <div class="layer-btn" data-layer="wind">Wind</div>
+  <div class="layer-btn" data-layer="radar">Radar</div>
   <div class="layer-btn" id="playBtn">▶ Forecast</div>
 </div>
-<div id="info">Drag to rotate • Pinch to zoom • Tap Sun or planets for info</div>
+<div id="info">Drag to rotate • Pinch to zoom • Tap Sun for info, or anywhere else for that spot's forecast</div>
 <div id="liveUpdated" style="position:absolute; bottom:env(safe-area-inset-bottom,68px); left:0; right:0; text-align:center; color:#8fdca0; font-family:sans-serif; font-size:10px; z-index:10; pointer-events:none;"></div>
 <div id="forecastBar"></div>
 <div id="panel"><span class="close">✕</span><div id="panelBody"></div></div>
@@ -250,7 +251,7 @@
     el.textContent = msg;
     infoWarningTimer = setTimeout(function(){
       el.textContent = mode==='earth'
-        ? 'Drag to rotate • Pinch to zoom • Tap Sun or Moon for info'
+        ? 'Drag to rotate • Pinch to zoom • Tap Sun/Moon for info, or anywhere else for that spot\'s forecast'
         : 'Drag to orbit • Pinch to zoom • Tap Sun or a planet for info';
     }, ms || 6000);
   }
@@ -381,6 +382,16 @@
         var hitObj = hits[0].object;
         var found = clickableObjects.find(function(c){return c.obj===hitObj;});
         if(found) onObjectTapped(found);
+        return;
+      }
+      // Nothing special was tapped — if it's the globe itself, pull a real forecast for that spot.
+      if(mode === 'earth' && globe){
+        var globeHits = raycaster.intersectObject(globe, false);
+        if(globeHits.length){
+          var localPt = globe.worldToLocal(globeHits[0].point.clone());
+          var ll = latLonFromLocalPosition(localPt);
+          showLocationForecastPanel(ll.lat, ll.lon);
+        }
       }
     }
 
@@ -510,9 +521,10 @@
         mode = b.getAttribute('data-mode');
         earthGroup.visible = (mode==='earth');
         solarGroup.visible = (mode==='solar');
+        Object.keys(overlayMeshes).forEach(function(k){ overlayMeshes[k].visible = (mode==='earth'); });
         camera.position.set(0,0, mode==='earth'?2.6:120);
         document.getElementById('info').textContent = mode==='earth'
-          ? 'Drag to rotate • Pinch to zoom • Tap Sun or Moon for info'
+          ? 'Drag to rotate • Pinch to zoom • Tap Sun/Moon for info, or anywhere else for that spot\'s forecast'
           : 'Drag to orbit • Pinch to zoom • Tap Sun or a planet for info';
         document.getElementById('panel').style.display = 'none';
       });
@@ -521,7 +533,7 @@
     document.getElementById('gravityToggle').addEventListener('click', function(){
       PLANETS.forEach(function(p){ if(p._gravMesh){ p._gravMesh.visible = false; } });
       document.getElementById('info').textContent = mode==='earth'
-        ? 'Drag to rotate • Pinch to zoom • Tap Sun or Moon for info'
+        ? 'Drag to rotate • Pinch to zoom • Tap Sun/Moon for info, or anywhere else for that spot\'s forecast'
         : 'Drag to orbit • Pinch to zoom • Tap a planet to toggle its gravity field';
     });
 
@@ -615,11 +627,53 @@
     document.getElementById('panel').style.display = 'block';
   }
 
+  // ---------------- Tap-anywhere real forecast (Open-Meteo, single point, 7 days) ----------------
+  var WEATHER_CODES = { // WMO weather codes, abbreviated
+    0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',
+    51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',
+    71:'Light snow',73:'Snow',75:'Heavy snow',80:'Rain showers',81:'Rain showers',82:'Violent showers',
+    95:'Thunderstorm',96:'Thunderstorm w/ hail',99:'Severe thunderstorm w/ hail'
+  };
+
+  async function showLocationForecastPanel(lat, lon){
+    document.getElementById('panelBody').innerHTML =
+      '<h3>Forecast — ' + lat.toFixed(1) + '°, ' + lon.toFixed(1) + '°</h3><div>Loading 7-day forecast…</div>';
+    document.getElementById('panel').style.display = 'block';
+    try{
+      var controller = new AbortController();
+      var timer = setTimeout(function(){controller.abort();}, 9000);
+      var url = "https://api.open-meteo.com/v1/forecast?latitude=" + lat.toFixed(3) + "&longitude=" + lon.toFixed(3) +
+                "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max" +
+                "&current=temperature_2m,weather_code&timezone=auto&forecast_days=7";
+      var res = await fetch(url, {signal: controller.signal});
+      clearTimeout(timer);
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      var data = await res.json();
+      var d = data.daily;
+      var html = '<h3>Forecast — ' + lat.toFixed(1) + '°, ' + lon.toFixed(1) + '°</h3>';
+      if(data.current){
+        html += '<div>Right now: <b>' + Math.round(data.current.temperature_2m) + '°C</b>, ' +
+                (WEATHER_CODES[data.current.weather_code] || 'n/a') + '</div><br>';
+      }
+      for(var i=0;i<d.time.length;i++){
+        var dayLabel = i===0 ? 'Today' : new Date(d.time[i]+'T00:00:00').toLocaleDateString(undefined,{weekday:'short'});
+        html += '<div>' + dayLabel + ': ' + Math.round(d.temperature_2m_min[i]) + '–' + Math.round(d.temperature_2m_max[i]) + '°C, ' +
+                (WEATHER_CODES[d.weather_code[i]] || 'n/a') + ', precip ' + d.precipitation_sum[i].toFixed(1) + 'mm, wind ' + Math.round(d.wind_speed_10m_max[i]) + 'km/h</div>';
+      }
+      html += '<div class="note">Real 7-day forecast from Open-Meteo for the exact point you tapped — this works anywhere on the globe, not just the coarse world-grid overlay layers.</div>';
+      document.getElementById('panelBody').innerHTML = html;
+    } catch(err){
+      document.getElementById('panelBody').innerHTML =
+        '<h3>Forecast — ' + lat.toFixed(1) + '°, ' + lon.toFixed(1) + '°</h3><div>Failed to load: ' + (err.message||'network error') + '</div>';
+    }
+  }
+
   // ---------------- Weather overlay layers (current conditions, independently toggleable) ----------------
   function disableLayer(layer){
     activeLayers[layer] = false;
     if(overlayMeshes[layer]){ scene.remove(overlayMeshes[layer]); delete overlayMeshes[layer]; }
     if(layer === 'wind'){ disableWindParticles(); }
+    if(layer === 'radar'){ disableRadar(); }
     checkLiveRefreshTimer();
   }
 
@@ -635,6 +689,21 @@
         setInfoWarning('Wind failed to load: ' + (err.message || 'network error') + ' — tap Wind again to retry');
         activeLayers['wind'] = false;
         document.querySelector('.layer-btn[data-layer="wind"]').classList.remove('active');
+        checkLiveRefreshTimer();
+      });
+      checkLiveRefreshTimer();
+      return;
+    }
+    if(layer === 'radar'){
+      infoEl.textContent = "Loading Doppler radar…";
+      enableRadar().then(function(){
+        infoEl.textContent = "Drag to rotate • Pinch to zoom";
+        markLiveUpdated();
+      }).catch(function(err){
+        console.error(err);
+        setInfoWarning('Radar failed to load: ' + (err.message || 'network error') + ' — tap Radar again to retry');
+        activeLayers['radar'] = false;
+        document.querySelector('.layer-btn[data-layer="radar"]').classList.remove('active');
         checkLiveRefreshTimer();
       });
       checkLiveRefreshTimer();
@@ -672,6 +741,7 @@
     Object.keys(activeLayers).forEach(function(layer){
       if(!activeLayers[layer]) return;
       if(layer === 'wind'){ refreshWindVectors(); }
+      else if(layer === 'radar'){ enableRadar().catch(function(){}); }
       else { buildOverlayGrid(layer, null).catch(function(){}); }
     });
     markLiveUpdated();
@@ -765,6 +835,67 @@
     delete overlayMeshes['wind'];
   }
 
+  // ---------------- Doppler radar (RainViewer public API — real, no key required) ----------------
+  // RainViewer's global radar tiles are in a Web Mercator (slippy-map) projection, but our globe's
+  // UV mapping is equirectangular. Stretching the stitched Mercator image onto equirectangular UVs
+  // is a simplification: accurate near the equator/mid-latitudes, increasingly compressed toward the
+  // poles. That's an acceptable trade-off since radar coverage is sparse at the poles anyway, but
+  // it's worth knowing this isn't pixel-perfect placement at high latitudes.
+  var radarMesh = null;
+  var RADAR_ZOOM = 2; // 4x4 = 16 tiles covering the whole world at 256px each -> 1024x1024 canvas
+
+  async function enableRadar(){
+    var controller = new AbortController();
+    var timer = setTimeout(function(){controller.abort();}, 9000);
+    var res = await fetch('https://api.rainviewer.com/public/weather-maps.json', {signal:controller.signal});
+    clearTimeout(timer);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    var meta = await res.json();
+    var frames = meta.radar && meta.radar.past;
+    if(!frames || !frames.length) throw new Error('no radar frames available');
+    var latest = frames[frames.length-1];
+    var host = meta.host;
+    var tilesPerSide = Math.pow(2, RADAR_ZOOM);
+    var tileSize = 256;
+    var canvas = document.createElement('canvas');
+    canvas.width = tileSize*tilesPerSide;
+    canvas.height = tileSize*tilesPerSide;
+    var ctx = canvas.getContext('2d');
+
+    var loads = [];
+    for(var ty=0; ty<tilesPerSide; ty++){
+      for(var tx=0; tx<tilesPerSide; tx++){
+        loads.push(loadRadarTile(host, latest.path, RADAR_ZOOM, tx, ty, ctx, tx*tileSize, ty*tileSize, tileSize));
+      }
+    }
+    await Promise.all(loads);
+
+    var tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    var geo = new THREE.SphereGeometry(1.03, 64, 64);
+    var mat = new THREE.MeshBasicMaterial({map:tex, transparent:true, opacity:0.75, depthWrite:false});
+    if(radarMesh){ scene.remove(radarMesh); }
+    radarMesh = new THREE.Mesh(geo, mat);
+    radarMesh.rotation.copy(globe.rotation);
+    earthGroup.add(radarMesh);
+    overlayMeshes['radar'] = radarMesh;
+  }
+
+  function loadRadarTile(host, path, z, x, y, ctx, destX, destY, size){
+    return new Promise(function(resolve){
+      var img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = function(){ try{ ctx.drawImage(img, destX, destY, size, size); }catch(e){} resolve(); };
+      img.onerror = function(){ resolve(); }; // missing tile (e.g. no radar coverage there) — leave transparent
+      img.src = host + path + '/' + size + '/' + z + '/' + x + '/' + y + '/2/1_1.png';
+    });
+  }
+
+  function disableRadar(){
+    if(radarMesh){ earthGroup.remove(radarMesh); radarMesh = null; }
+    delete overlayMeshes['radar'];
+  }
+
   async function refreshWindVectors(){
     if(!windParticles) return;
     var grid = windParticles.grid;
@@ -847,6 +978,19 @@
       radius*Math.cos(phi),
       radius*Math.sin(phi)*Math.sin(theta)
     );
+  }
+
+  // Inverse of latLonToVec3 — recovers lat/lon from a point in the globe's own local
+  // (unrotated-texture) space, which is what globe.worldToLocal() gives us.
+  function latLonFromLocalPosition(p){
+    var r = p.length() || 1;
+    var phi = Math.acos(Math.max(-1, Math.min(1, p.y / r)));
+    var lat = 90 - phi * 180/Math.PI;
+    var theta = Math.atan2(p.z, -p.x);
+    var lon = theta * 180/Math.PI - 180;
+    if(lon < -180) lon += 360;
+    if(lon > 180) lon -= 360;
+    return { lat:lat, lon:lon };
   }
 
   function colorForValue(layer, v){
