@@ -57,6 +57,9 @@
   <div class="layer-btn" data-layer="storms">&#127786; Storms</div>
   <div class="layer-btn" data-layer="cyclones">&#127744; Hurricanes</div>
   <div class="layer-btn" data-layer="volcanoes">&#127755; Volcanoes</div>
+  <div class="layer-btn" data-layer="buoys">&#9875; Buoys</div>
+  <div class="layer-btn" data-layer="wildfires">&#128293; Wildfires</div>
+  <div class="layer-btn" data-layer="lightning">&#9889; Lightning</div>
 </div>
 <div id="info">Drag to rotate • Pinch to zoom • Tap Sun for info, or anywhere else for that spot's forecast</div>
 <div id="liveUpdated" style="position:absolute; bottom:env(safe-area-inset-bottom,68px); left:0; right:0; text-align:center; color:#8fdca0; font-family:sans-serif; font-size:10px; z-index:10; pointer-events:none;"></div>
@@ -1026,13 +1029,14 @@
     else if(layer === 'clouds'){ c.setHSL(0, 0, 0.5+v*0.5); }
     else if(layer === 'pressure'){ c.setHSL(0.78*(1-v), 0.85, 0.5); }
     else if(layer === 'wind'){ c.setHSL(0.38-v*0.38, 1.0, 0.5); }
+    else if(layer === 'lightning'){ c.setHSL(0.16+v*0.64, 1.0, 0.5); }
     else { c.setHSL(0,0,0.6); }
     return c;
   }
 
   var FIELD_MAP = {
     temp: 'temperature_2m', precip: 'precipitation', clouds: 'cloud_cover',
-    pressure: 'surface_pressure', wind: 'wind_speed_10m'
+    pressure: 'surface_pressure', wind: 'wind_speed_10m', lightning: 'cape'
   };
 
   function buildGridPoints(){
@@ -1171,7 +1175,7 @@
   }
 
   // When multiple layers are on at once, stack their point shells slightly apart so they don't z-fight.
-  var LAYER_SHELL_OFFSET = { temp:0, precip:0.01, clouds:0.02, pressure:0.03, wind:0.04 };
+  var LAYER_SHELL_OFFSET = { temp:0, precip:0.01, clouds:0.02, pressure:0.03, wind:0.04, lightning:0.05 };
 
   // ---------------- Forecast playback (real Open-Meteo hourly forecast, ~48h) ----------------
   // Plays back every layer that's currently toggled on, in sync.
@@ -1382,6 +1386,55 @@
     document.getElementById('panel').style.display = 'block';
     return true;
   }
+
+
+  // ================= BUOYS + WILDFIRES (+ lightning risk via the weather grid) =================
+  // buoys: NOAA NDBC latest observations | wildfires: NASA EONET open wildfire events (global, no key)
+  // lightning: modeled storm energy (CAPE) from Open-Meteo, shown with the grid layers (not live strike sensors)
+  var NDBC_URL = 'https://www.ndbc.noaa.gov/data/latest_obs/latest_obs.txt';
+  HAZARD_LAYERS.buoys = {label:'ocean buoys'};
+  HAZARD_LAYERS.wildfires = {label:'wildfires'};
+
+  async function fetchText(url, ms){
+    var c = new AbortController(), tm = setTimeout(function(){ c.abort(); }, ms || 12000);
+    try{
+      var r = await fetch(url, {signal:c.signal});
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    } finally { clearTimeout(tm); }
+  }
+
+  var loadHazardBase = loadHazard;
+  loadHazard = async function(layer){
+    if(layer !== 'buoys' && layer !== 'wildfires') return loadHazardBase(layer);
+    var items = [];
+    if(layer === 'buoys'){
+      var txt = await fetchText(NDBC_URL, 15000);
+      txt.split('\n').forEach(function(line){
+        if(!line || line[0] === '#') return;
+        var a = line.trim().split(/\s+/);
+        if(a.length < 19) return;
+        var lat = +a[1], lon = +a[2];
+        if(isNaN(lat) || isNaN(lon)) return;
+        var wv = a[11]==='MM' ? null : +a[11], wt = a[18]==='MM' ? null : +a[18], ws = a[9]==='MM' ? null : +a[9];
+        items.push({lat:lat, lon:lon, size:0.016,
+          color: wv==null ? 0x8e8e93 : (wv<1 ? 0x32ade6 : (wv<2.5 ? 0x30d158 : (wv<4 ? 0xffcc00 : 0xff3b30))),
+          title:'Buoy ' + a[0],
+          detail:'Waves: ' + (wv==null ? 'n/a' : wv + ' m') + ' • Water: ' + (wt==null ? 'n/a' : wt + ' C') +
+                 ' • Wind: ' + (ws==null ? 'n/a' : ws + ' m/s') + ' • ' + a[3] + '-' + a[4] + '-' + a[5] + ' ' + a[6] + ':' + a[7] + ' UTC (blue <1 m, green <2.5, yellow <4, red higher)'});
+      });
+    } else {
+      var d = await throttledFetchJson('https://eonet.gsfc.nasa.gov/api/v3/events?category=wildfires&status=open&limit=300', 15000);
+      (d.events || []).forEach(function(e){
+        var g = e.geometry && e.geometry[e.geometry.length - 1];
+        if(!g || g.type !== 'Point') return;
+        items.push({lat:g.coordinates[1], lon:g.coordinates[0], size:0.022, color:0xff6b00,
+          title:e.title || 'Wildfire', detail:'Last reported ' + new Date(g.date).toLocaleString() + ' • source: NASA EONET'});
+      });
+    }
+    renderHazard(layer, items);
+    return items.length;
+  };
 
   init();
 })();
