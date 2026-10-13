@@ -52,6 +52,12 @@
   <div class="layer-btn" data-layer="radar">Radar</div>
   <div class="layer-btn" id="playBtn">▶ Forecast</div>
 </div>
+<div id="hud3" style="position:absolute; top:calc(env(safe-area-inset-top,10px) + 112px); left:0; right:0; display:flex; justify-content:center; gap:6px; z-index:10; padding:0 6px; flex-wrap:wrap;">
+  <div class="layer-btn" data-layer="quakes">&#128308; Quakes</div>
+  <div class="layer-btn" data-layer="storms">&#127786; Storms</div>
+  <div class="layer-btn" data-layer="cyclones">&#127744; Hurricanes</div>
+  <div class="layer-btn" data-layer="volcanoes">&#127755; Volcanoes</div>
+</div>
 <div id="info">Drag to rotate • Pinch to zoom • Tap Sun for info, or anywhere else for that spot's forecast</div>
 <div id="liveUpdated" style="position:absolute; bottom:env(safe-area-inset-bottom,68px); left:0; right:0; text-align:center; color:#8fdca0; font-family:sans-serif; font-size:10px; z-index:10; pointer-events:none;"></div>
 <div id="forecastBar"></div>
@@ -413,7 +419,7 @@
         if(globeHits.length){
           var localPt = globe.worldToLocal(globeHits[0].point.clone());
           var ll = latLonFromLocalPosition(localPt);
-          showLocationForecastPanel(ll.lat, ll.lon);
+          if(!hazardTapped(ll.lat, ll.lon)){ showLocationForecastPanel(ll.lat, ll.lon); }
         }
       }
     }
@@ -696,6 +702,7 @@
   }
 
   function enableLayer(layer){
+    if(HAZARD_LAYERS[layer]){ enableHazard(layer); return; }
     var infoEl = document.getElementById('info');
     if(layer === 'wind'){
       infoEl.textContent = "Loading wind vector data…";
@@ -758,7 +765,8 @@
     if(forecastPlaying) return; // don't fight with forecast playback
     Object.keys(activeLayers).forEach(function(layer){
       if(!activeLayers[layer]) return;
-      if(layer === 'wind'){ refreshWindVectors(); }
+      if(HAZARD_LAYERS[layer]){ loadHazard(layer).catch(function(){}); }
+      else if(layer === 'wind'){ refreshWindVectors(); }
       else if(layer === 'radar'){ enableRadar().catch(function(){}); }
       else { buildOverlayGrid(layer, null).catch(function(){}); }
     });
@@ -1170,7 +1178,7 @@
   async function startForecast(){
     // Wind is now a live particle flow (real-time, continuously animated) rather than a
     // static snapshot, so it's excluded from hourly forecast playback.
-    var layers = Object.keys(activeLayers).filter(function(l){ return activeLayers[l] && l !== 'wind'; });
+    var layers = Object.keys(activeLayers).filter(function(l){ return activeLayers[l] && l !== 'wind' && !HAZARD_LAYERS[l]; });
     if(!layers.length){
       document.getElementById('info').textContent = 'Turn on at least one layer (Temp/Precip/etc) before playing the forecast';
       return;
@@ -1241,6 +1249,138 @@
     btn.textContent = '▶ Forecast';
     btn.classList.remove('active');
     document.getElementById('forecastBar').style.display = 'none';
+  }
+
+
+  // ================= NATURAL HAZARD LAYERS =================
+  // quakes: USGS M2.5+ past 7 days | storms: NWS active US warnings (tornado, severe t-storm, flash flood, tropical)
+  // cyclones: GDACS tropical cyclones (global) | volcanoes: USGS volcano alert levels + GDACS eruptions
+  var HAZARD_LAYERS = {
+    quakes:{label:'earthquakes'}, storms:{label:'storm warnings'},
+    cyclones:{label:'hurricanes/cyclones'}, volcanoes:{label:'volcano alerts'}
+  };
+  var hazardItems = {};
+  var GDACS_URL = 'https://www.gdacs.org/gdacsapi/api/events/geteventlist/EVENTS4APP';
+
+  function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function alertColor(a){
+    a = String(a||'').toUpperCase();
+    return a==='RED' ? 0xff3b30 : (a==='ORANGE' ? 0xff9500 : (a==='YELLOW' ? 0xffd60a : 0x30d158));
+  }
+
+  async function gdacsEvents(type){
+    var d = await throttledFetchJson(GDACS_URL, 15000);
+    return (d.features||[]).filter(function(f){
+      return f.properties && f.properties.eventtype === type && f.geometry && f.geometry.type === 'Point';
+    });
+  }
+
+  async function loadHazard(layer){
+    var items = [];
+    if(layer === 'quakes'){
+      var q = await throttledFetchJson('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_week.geojson', 12000);
+      (q.features||[]).forEach(function(f){
+        var c = f.geometry && f.geometry.coordinates; if(!c) return;
+        var m = f.properties.mag || 0, ageH = (Date.now()-f.properties.time)/3600000;
+        items.push({lat:c[1], lon:c[0], size:0.008+m*0.006,
+          color: ageH<24 ? 0xff3b30 : (ageH<72 ? 0xff9500 : 0xffd60a),
+          title:'M'+m.toFixed(1)+' — '+(f.properties.place||'earthquake'),
+          detail:new Date(f.properties.time).toLocaleString()+' • depth '+Math.round(c[2])+' km (red <24h, orange <72h, yellow older)'});
+      });
+    } else if(layer === 'storms'){
+      var url = 'https://api.weather.gov/alerts/active?event=Tornado%20Warning,Tornado%20Watch,Severe%20Thunderstorm%20Warning,Flash%20Flood%20Warning,Hurricane%20Warning,Tropical%20Storm%20Warning';
+      var s = await throttledFetchJson(url, 15000);
+      (s.features||[]).forEach(function(f){
+        var g = f.geometry; if(!g || !g.coordinates) return;
+        var ring = g.type==='Polygon' ? g.coordinates[0] : (g.type==='MultiPolygon' ? g.coordinates[0][0] : null);
+        if(!ring || !ring.length) return;
+        var sx=0, sy=0; ring.forEach(function(p){ sx+=p[0]; sy+=p[1]; });
+        var ev = f.properties.event || '';
+        var tor = ev.indexOf('Tornado')>=0;
+        items.push({lat:sy/ring.length, lon:sx/ring.length, size:tor?0.03:0.022,
+          color: tor ? 0xff2d55 : (/Hurricane|Tropical/.test(ev) ? 0xbf5af2 : (ev.indexOf('Flood')>=0 ? 0x32ade6 : 0xffcc00)),
+          title:ev, detail:(f.properties.areaDesc||'').slice(0,140)+' • expires '+(f.properties.expires ? new Date(f.properties.expires).toLocaleString() : 'unknown')});
+      });
+    } else if(layer === 'cyclones'){
+      (await gdacsEvents('TC')).forEach(function(f){
+        var p = f.properties, sev = p.severitydata && p.severitydata.severitytext;
+        items.push({lat:f.geometry.coordinates[1], lon:f.geometry.coordinates[0], size:0.04, color:alertColor(p.alertlevel),
+          title:(p.name || 'Tropical cyclone')+(p.country ? ' — '+p.country : ''),
+          detail:(sev || '')+' • GDACS alert level: '+(p.alertlevel||'n/a')});
+      });
+    } else if(layer === 'volcanoes'){
+      try{
+        var v = await throttledFetchJson('https://volcanoes.usgs.gov/vsc/api/volcanoApi/vhpstatus', 15000);
+        (Array.isArray(v) ? v : []).forEach(function(x){
+          var la = x.lat!=null ? x.lat : x.latitude, lo = x.long!=null ? x.long : (x.lng!=null ? x.lng : x.longitude);
+          var cc = String(x.colorCode||'').toUpperCase();
+          if(la==null || lo==null || cc==='GREEN' || cc==='UNASSIGNED' || !cc) return; // only volcanoes above normal
+          items.push({lat:+la, lon:+lo, size:0.03, color:alertColor(cc),
+            title:(x.vName||'Volcano')+' — '+cc, detail:'USGS alert level: '+(x.alertLevel||'n/a')});
+        });
+      } catch(e){ console.error('USGS volcano feed failed', e); }
+      try{
+        (await gdacsEvents('VO')).forEach(function(f){
+          var p = f.properties;
+          items.push({lat:f.geometry.coordinates[1], lon:f.geometry.coordinates[0], size:0.03, color:alertColor(p.alertlevel),
+            title:(p.name || 'Volcano')+(p.country ? ' — '+p.country : ''), detail:'GDACS alert level: '+(p.alertlevel||'n/a')});
+        });
+      } catch(e){ console.error('GDACS volcano feed failed', e); }
+    }
+    renderHazard(layer, items);
+    return items.length;
+  }
+
+  function renderHazard(layer, items){
+    if(!activeLayers[layer]) return; // toggled off while loading
+    if(overlayMeshes[layer]){ scene.remove(overlayMeshes[layer]); }
+    var grp = new THREE.Group(), geo = new THREE.SphereGeometry(1, 8, 8), mats = {};
+    items.forEach(function(it){
+      var m = mats[it.color] || (mats[it.color] = new THREE.MeshBasicMaterial({color:it.color, transparent:true, opacity:0.9, depthWrite:false}));
+      var mesh = new THREE.Mesh(geo, m);
+      mesh.position.copy(latLonToVec3(it.lat, it.lon, 1.025));
+      mesh.scale.setScalar(it.size);
+      grp.add(mesh);
+    });
+    grp.rotation.copy(globe.rotation);
+    grp.visible = (mode === 'earth');
+    scene.add(grp);
+    overlayMeshes[layer] = grp;
+    hazardItems[layer] = items;
+  }
+
+  function enableHazard(layer){
+    var infoEl = document.getElementById('info'), label = HAZARD_LAYERS[layer].label;
+    infoEl.textContent = 'Loading ' + label + '…';
+    loadHazard(layer).then(function(n){
+      markLiveUpdated();
+      setInfoWarning(n===0 ? 'No ' + label + ' reported right now' : n + ' ' + label + ' shown — tap a marker for details', 5000);
+    }).catch(function(err){
+      console.error(err);
+      setInfoWarning(label + ' failed to load: ' + (err.message || 'network error') + ' — tap it again to retry');
+      activeLayers[layer] = false;
+      var b = document.querySelector('.layer-btn[data-layer="'+layer+'"]'); if(b) b.classList.remove('active');
+      checkLiveRefreshTimer();
+    });
+    checkLiveRefreshTimer();
+  }
+
+  // Tap near a hazard marker -> show its details instead of the point forecast.
+  function hazardTapped(lat, lon){
+    var best = null, bd = 1e9, thr = 4 * (camera.position.z / 2.6);
+    Object.keys(hazardItems).forEach(function(layer){
+      if(!activeLayers[layer]) return;
+      hazardItems[layer].forEach(function(it){
+        var dLat = it.lat-lat, dLon = ((it.lon-lon+540)%360)-180;
+        var d = Math.sqrt(dLat*dLat + dLon*dLon*Math.pow(Math.cos(lat*Math.PI/180),2));
+        if(d < thr && d < bd){ bd = d; best = it; }
+      });
+    });
+    if(!best) return false;
+    document.getElementById('panelBody').innerHTML = '<h3>' + esc(best.title) + '</h3><div>' + esc(best.detail) + '</div>' +
+      '<div class="note">Informational only. For life-safety alerts rely on official sources: NWS, USGS, local emergency management, and Wireless Emergency Alerts.</div>';
+    document.getElementById('panel').style.display = 'block';
+    return true;
   }
 
   init();
